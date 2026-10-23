@@ -1,25 +1,309 @@
-import platform
+"""A self-contained commons agent over made-up forest canopy data.
+
+    uv run --with anthropic shiny run demo.py   # the chat
+    uv run --with anthropic python demo.py      # the same questions, in the terminal
+
+The chat is assembled here rather than through `commons.ui.app()`, because
+`app()` shares one agent across sessions; a deployed app should instead build
+one agent per session, inside the server function. The assembly is three pieces,
+at the bottom of this file: the page from `shinychat.page_chat()` with
+`theme=commons.ui.theme()`, a server function passing a fresh agent to
+`commons.ui.server()`, and `shiny.App()` joining the two.
+
+This demo is analogous to `pkg-r/inst/demo.R` in the R implementation. You
+can also play around with the demo interactively in a notebook by using
+`demo.ipynb` (without a shiny UI, in that case).
+
+The client comes from `chatlas.ChatAuto`, so `CHATLAS_CHAT_PROVIDER_MODEL`
+picks a different provider without editing this file. chatlas ships no
+provider SDK and neither does commons, hence the `uv run --with`. For example, to
+use Claude sonnet on Bedrock:
+
+    export CHATLAS_CHAT_PROVIDER_MODEL=bedrock-anthropic/us.anthropic.claude-sonnet-5
+    uv run --with 'anthropic[bedrock]' shiny run demo.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from functools import cache
 from pathlib import Path
+from tempfile import mkdtemp
+from typing import Annotated, Any
 
-from shiny.express import render
+import chatlas
+import pandas as pd
+import shinychat
+from pydantic import Field
+from shiny import App, Inputs, Outputs, Session
 
-from commons._execution import _sandbox
+import commons
+
+DEFAULT_MODEL = "anthropic/claude-opus-5-5"
+
+stands = pd.DataFrame(
+    {
+        "stand_id": range(1, 9),
+        "name": [
+            "Nehalem Bench",
+            "Saddle Mountain",
+            "Mohawk Divide",
+            "Fall Creek",
+            "Winberry Ridge",
+            "Sprague Rim",
+            "Chiloquin Flat",
+            "Antelope Draw",
+        ],
+        "county": [
+            "Clatsop",
+            "Clatsop",
+            "Lane",
+            "Lane",
+            "Lane",
+            "Klamath",
+            "Klamath",
+            "Klamath",
+        ],
+        "forest_type": [
+            "Douglas-fir",
+            "Sitka spruce",
+            "Douglas-fir",
+            "mixed conifer",
+            "Douglas-fir",
+            "ponderosa pine",
+            "ponderosa pine",
+            "lodgepole pine",
+        ],
+        "status": [
+            "established",
+            "established",
+            "established",
+            "established",
+            "regeneration",
+            "established",
+            "established",
+            "regeneration",
+        ],
+        "acres": [1240, 860, 3150, 720, 410, 2480, 1590, 640],
+    }
+)
+
+surveys = pd.DataFrame(
+    {
+        "stand_id": [stand for stand in range(1, 9) for _ in (0, 1)],
+        "survey_year": [2021, 2026] * 8,
+        "canopy_pct": [
+            78, 81,
+            84, 86,
+            71, 74,
+            62, 67,
+            18, 34,
+            45, 47,
+            52, 49,
+            12, 26,
+        ],
+    }
+)  # fmt: skip
+
+NOTES = """\
+Canopy cover is always acre-weighted. A plain average across stands treats a 400-acre unit the same as a 4,000-acre one.
+
+Baseline canopy statistics cover established stands only; regeneration units are tracked separately until they close canopy.
+
+The surveys table has one row per stand per survey year, so a query that doesn't pin a year mixes survey cycles.
+"""
 
 
-def _try(fn):
-    try:
-        return fn()
-    except Exception as err:
-        return f"{type(err).__name__}: {err}"
+def notes_file() -> Path:
+    path = Path(mkdtemp()) / "canopy-notes.md"
+    path.write_text(NOTES)
+    return path
 
 
-@render.code
-def out():
-    return "\n".join(
-        [
-            f"kernel: {platform.release()}",
-            f"lsm: {_try(lambda: Path('/sys/kernel/security/lsm').read_text())}",
-            f"capabilities: {_try(_sandbox.sandbox_capabilities)}",
-            f"protection_mode: {_try(_sandbox.protection_mode)}",
-        ]
+# Written once per process, then read by every session's context layer. Not
+# written at import, so `shiny run --reload` re-imports don't pile up files.
+@cache
+def shared_notes_file() -> Path:
+    return notes_file()
+
+
+@commons.measure(
+    # Past the card's clamp length on purpose: the chat UI collapses a long
+    # description like this behind a "See more" disclosure.
+    description=(
+        "Acre-weighted canopy cover for each county, from the most recent "
+        "survey. Each stand counts in proportion to its acreage, so a "
+        "400-acre unit does not move the figure the way a 4,000-acre one "
+        "does. Established stands only: regeneration units are tracked "
+        "separately until they close canopy. When several survey years are "
+        "present, only the most recent one enters."
     )
+)
+def canopy_by_county(warehouse: commons.Injected[Any]) -> pd.DataFrame:
+    return warehouse.execute(
+        """
+        SELECT county,
+               SUM(canopy_pct * acres) / SUM(acres) AS canopy_pct,
+               SUM(acres) AS acres
+        FROM stands JOIN surveys USING (stand_id)
+        WHERE status = 'established'
+          AND survey_year = (SELECT MAX(survey_year) FROM surveys)
+        GROUP BY county ORDER BY canopy_pct DESC
+        """
+    ).fetchdf()
+
+
+@commons.measure(
+    description="Established stands with the least canopy cover today, thinnest first."
+)
+def low_canopy_stands(warehouse: commons.Injected[Any]) -> pd.DataFrame:
+    return warehouse.execute(
+        """
+        SELECT name, county, forest_type, canopy_pct, acres
+        FROM stands JOIN surveys USING (stand_id)
+        WHERE status = 'established'
+          AND survey_year = (SELECT MAX(survey_year) FROM surveys)
+        ORDER BY canopy_pct
+        """
+    ).fetchdf()
+
+
+@commons.measure(
+    description=(
+        "A county's current canopy cover as one headline figure, drawn as a "
+        "card. Use when someone asks for a headline, big number, or summary "
+        "readout for a single county."
+    ),
+    title="Canopy headline",
+)
+def canopy_headline(
+    county: Annotated[str, Field(description="The county to summarize.")],
+    warehouse: commons.Injected[Any],
+) -> chatlas.ContentToolResult:
+    # A measure returning a ContentToolResult authors its own HTML; commons
+    # frames it inside the standard card, after the metadata and arguments.
+    pct, acres = warehouse.execute(
+        """
+        SELECT SUM(canopy_pct * acres) / SUM(acres) AS canopy_pct,
+               SUM(acres) AS acres
+        FROM stands JOIN surveys USING (stand_id)
+        WHERE county = ? AND status = 'established'
+          AND survey_year = (SELECT MAX(survey_year) FROM surveys)
+        """,
+        [county],
+    ).fetchone()
+    return chatlas.ContentToolResult(
+        value=(
+            f"{county} County: {pct:.1f}% canopy cover across "
+            f"{acres:,.0f} established acres, 2026 survey."
+        ),
+        extra={
+            "display": {
+                "html": (
+                    "<div style='text-align: center; padding: 0.5rem 0'>"
+                    f"<div style='font-size: 2.5rem; font-weight: 300'>"
+                    f"{pct:.0f}%</div>"
+                    f"<div>canopy cover across {acres:,.0f} "
+                    "established acres</div>"
+                    "</div>"
+                )
+            }
+        },
+    )
+
+
+def client() -> chatlas.Chat:
+    """A chat client, from `CHATLAS_CHAT_PROVIDER_MODEL` when it is set."""
+    return chatlas.ChatAuto(os.getenv("CHATLAS_CHAT_PROVIDER_MODEL") or DEFAULT_MODEL)
+
+
+def agent() -> commons.Commons:
+    """The canopy agent, over all three layers."""
+    return commons.Commons(
+        client=client(),
+        # Named, because a measure's `warehouse` argument is injected by name.
+        data_sources={"warehouse": commons.data_source(stands=stands, surveys=surveys)},
+        semantic_layer=commons.semantic_layer(
+            canopy_by_county, low_canopy_stands, canopy_headline
+        ),
+        context_layer=commons.context_layer(files=[shared_notes_file()]),
+    )
+
+
+QUESTIONS = [
+    # Covered by a measure, so the answer should have the Trusted outcome.
+    "Which county has the most canopy cover?",
+    "Which stands have the least canopy cover?",
+    # Covered by a measure that draws its own card.
+    "Draw a canopy headline for Lane County.",
+    # No measure covers a single stand's change over time, so this one has to
+    # reach run_sql, and the answer is untrusted or cited instead.
+    "How much canopy has Winberry Ridge gained since 2021?",
+    # Only a plot needs run_python, so this one exercises the sandboxed worker.
+    "Plot each stand's canopy cover in 2021 and 2026 as a bar chart.",
+]
+
+
+def tools_run(canopy: commons.Commons) -> list[str]:
+    """Which tools the conversation has run, in order."""
+    return [
+        content.name
+        for turn in canopy.get_turns()
+        for content in turn.contents
+        if isinstance(content, chatlas.ContentToolResult)
+    ]
+
+
+async def ask(canopy: commons.Commons, question: str) -> None:
+    """Stream one answer, with a line naming each tool as it runs.
+
+    `content="all"` is the mode a chat UI drives an agent through. Asking for
+    text instead yields a bare "\\n\\n" per tool result, standing in for the
+    content it is not emitting, which a terminal shows as a blank gap that
+    grows with the number of tools.
+    """
+    print(f"\n{'=' * 72}\n>>> {question}\n{'=' * 72}", flush=True)
+    async for chunk in await canopy.stream_async(question, content="all"):
+        if isinstance(chunk, chatlas.ContentToolRequest):
+            print(f"\n[{chunk.name}]", flush=True)
+        elif isinstance(chunk, str):
+            # The provenance marker and any citation arrive as their own
+            # chunks of HTML; a UI renders them, so give them their own line.
+            lead = "\n\n" if chunk.startswith("<shiny-aside") else ""
+            print(f"{lead}{chunk}", end="", flush=True)
+    print(flush=True)
+
+
+async def main() -> None:
+    canopy = agent()
+    for question in QUESTIONS:
+        await ask(canopy, question)
+
+
+# Derived from QUESTIONS, so the chat suggests what the terminal run asks.
+GREETING = (
+    "Chat with this agent to learn about canopy cover in Oregon's forests."
+    "\n\nHere are some example questions:\n\n"
+) + "".join(
+    f"- <span class='suggestion'>{question}</span>\n" for question in QUESTIONS
+)
+
+app_ui = shinychat.page_chat(
+    "Canopy cover explorer",
+    id="chat",
+    greeting=GREETING,
+    theme=commons.ui.theme(),
+)
+
+
+def app_server(input: Inputs, output: Outputs, session: Session) -> None:
+    # One agent per session, so each visitor gets their own agent state.
+    commons.ui.server("chat", agent())
+
+
+app = App(app_ui, app_server)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
