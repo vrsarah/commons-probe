@@ -1,1 +1,1 @@
-commons[shiny]==0.1.0b2
+commons[shiny] @ git+https://github.com/posit-dev/commons.git@0d30ea4ffa99749dbaba90c4c767ce527e4221e0#subdirectory=pkg-py
